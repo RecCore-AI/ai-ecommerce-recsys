@@ -4,6 +4,7 @@ from search_engine import SearchEngine
 def print_results(response: dict) -> None:
     print("\n========== 검색 결과 ==========")
     print(f"search_type: {response['search_type']}")
+    print(f"method: {response['method']}")
     print(f"latency_ms: {response['latency_ms']}")
     print(f"total_count: {response['total_count']}")
 
@@ -21,10 +22,10 @@ def main() -> None:
     engine = SearchEngine(
         products_path="simulator/data/products.csv",
         artifacts_dir="search/artifacts",
+        device="cpu",
     )
 
     engine.load_products()
-    engine.load_model(rebuild=True)
 
     queries = [
         "의류 상의 니트 low",
@@ -34,9 +35,18 @@ def main() -> None:
         "전자제품 PC 모니터 high",
     ]
 
+    print("\n\n==================== TF-IDF BASELINE ====================")
+    engine.load_model(method="tfidf", rebuild=False)
     for query in queries:
         print(f"\n\nQuery: {query}")
-        response = engine.search(query_text=query, top_k=10)
+        response = engine.search(query_text=query, top_k=10, method="tfidf")
+        print_results(response)
+
+    print("\n\n==================== CLIP TEXT SEARCH ====================")
+    engine.load_model(method="clip", rebuild=False)
+    for query in queries:
+        print(f"\n\nQuery: {query}")
+        response = engine.search(query_text=query, top_k=10, method="clip")
         print_results(response)
 
 

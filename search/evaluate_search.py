@@ -47,15 +47,16 @@ def category_mrr(results: list[dict], target: pd.Series) -> float:
 
 def category_ndcg_at_k(results: list[dict], target: pd.Series, k: int = 10) -> float:
     dcg = 0.0
+
     for rank, item in enumerate(results[:k], start=1):
         if same_group(item, target):
             dcg += 1.0 / math.log2(rank + 1)
 
-    ideal_relevant_count = min(k, len(results))
-    idcg = sum(1.0 / math.log2(rank + 1) for rank in range(1, ideal_relevant_count + 1))
+    idcg = sum(1.0 / math.log2(rank + 1) for rank in range(1, k + 1))
 
     if idcg == 0:
         return 0.0
+
     return dcg / idcg
 
 
@@ -68,26 +69,14 @@ def make_query_from_product(row: pd.Series) -> str:
     )
 
 
-def main() -> None:
-    products_path = Path("simulator/data/products.csv")
-    test_logs_path = Path("simulator/data/test_logs.csv")
-
-    products = pd.read_csv(products_path)
-    test_logs = pd.read_csv(test_logs_path)
-
-    search_logs = test_logs[test_logs["event_type"] == "search"].copy()
-
-    if search_logs.empty:
-        raise ValueError("test_logs.csv에 event_type=search 로그가 없습니다.")
-
+def evaluate_method(
+    engine: SearchEngine,
+    products: pd.DataFrame,
+    search_logs: pd.DataFrame,
+    method: str,
+    max_eval: int = 1000,
+) -> None:
     product_map = products.set_index("product_id")
-
-    engine = SearchEngine(
-        products_path=str(products_path),
-        artifacts_dir="search/artifacts",
-    )
-    engine.load_products()
-    engine.load_model(rebuild=False)
 
     exact_mrr_scores = []
     exact_ndcg_scores = []
@@ -98,10 +87,10 @@ def main() -> None:
 
     latency_list = []
 
-    max_eval = min(1000, len(search_logs))
-    eval_logs = search_logs.head(max_eval)
-
+    eval_logs = search_logs.head(min(max_eval, len(search_logs)))
     valid_count = 0
+
+    engine.load_model(method=method, rebuild=False)
 
     for _, log in eval_logs.iterrows():
         product_id = log["product_id"]
@@ -112,7 +101,7 @@ def main() -> None:
         target_product = product_map.loc[product_id]
         query = make_query_from_product(target_product)
 
-        response = engine.search(query_text=query, top_k=10)
+        response = engine.search(query_text=query, top_k=10, method=method)
         results = response["results"]
 
         exact_mrr_scores.append(exact_mrr(results, product_id))
@@ -128,7 +117,10 @@ def main() -> None:
     if valid_count == 0:
         raise ValueError("평가 가능한 search 로그가 없습니다.")
 
-    print("\n========== Search Baseline Evaluation ==========")
+    avg_latency = sum(latency_list) / len(latency_list)
+    p95_latency = sorted(latency_list)[int(len(latency_list) * 0.95) - 1]
+
+    print(f"\n\n========== {method.upper()} Search Evaluation ==========")
     print(f"eval_count: {valid_count}")
 
     print("\n[Exact Product ID Evaluation]")
@@ -140,12 +132,45 @@ def main() -> None:
     print(f"Category MRR: {sum(category_mrr_scores) / len(category_mrr_scores):.4f}")
     print(f"Category NDCG@10: {sum(category_ndcg_scores) / len(category_ndcg_scores):.4f}")
 
-    avg_latency = sum(latency_list) / len(latency_list)
-    p95_latency = sorted(latency_list)[int(len(latency_list) * 0.95) - 1]
-
     print("\n[Latency]")
     print(f"avg_latency_ms: {avg_latency:.3f}")
     print(f"p95_latency_ms: {p95_latency:.3f}")
+
+
+def main() -> None:
+    products_path = Path("simulator/data/products.csv")
+    test_logs_path = Path("simulator/data/test_logs.csv")
+
+    products = pd.read_csv(products_path)
+    test_logs = pd.read_csv(test_logs_path)
+
+    search_logs = test_logs[test_logs["event_type"] == "search"].copy()
+
+    if search_logs.empty:
+        raise ValueError("test_logs.csv에 event_type=search 로그가 없습니다.")
+
+    engine = SearchEngine(
+        products_path=str(products_path),
+        artifacts_dir="search/artifacts",
+        device="cpu",
+    )
+    engine.load_products()
+
+    evaluate_method(
+        engine=engine,
+        products=products,
+        search_logs=search_logs,
+        method="tfidf",
+        max_eval=1000,
+    )
+
+    evaluate_method(
+        engine=engine,
+        products=products,
+        search_logs=search_logs,
+        method="clip",
+        max_eval=1000,
+    )
 
 
 if __name__ == "__main__":
