@@ -26,6 +26,8 @@ class SearchEngine:
         self.vectorizer_path = self.artifacts_dir / "text_vectorizer.pkl"
         self.matrix_path = self.artifacts_dir / "baseline_matrix.npy"
         self.clip_embeddings_path = self.artifacts_dir / "clip_text_embeddings.npy"
+        self.faiss_index_path = self.artifacts_dir / "clip_text_flat.index"
+        self.faiss_index = None
 
         self.clip_model_name = clip_model_name
         self.device = device
@@ -82,6 +84,11 @@ class SearchEngine:
         elif method == "clip":
             self._load_clip_model()
             self._load_or_build_clip_embeddings(rebuild=rebuild)
+
+        elif method == "clip_faiss":
+            self._load_clip_model()
+            self._load_or_build_clip_embeddings(rebuild=rebuild)
+            self._load_or_build_faiss_index(rebuild=rebuild)
         else:
             raise ValueError(f"지원하지 않는 method입니다: {method}")
 
@@ -154,6 +161,46 @@ class SearchEngine:
 
         print(f"[CLIP] 임베딩 저장 완료: {self.clip_embeddings_path}")
 
+    def _load_or_build_faiss_index(self, rebuild: bool = False) -> None:
+        if self.clip_text_embeddings is None:
+            self._load_or_build_clip_embeddings(rebuild=False)
+
+        assert self.clip_text_embeddings is not None
+
+        import faiss
+
+        if not rebuild and self.faiss_index_path.exists():
+            self.faiss_index = faiss.read_index(str(self.faiss_index_path))
+            return
+
+        dimension = self.clip_text_embeddings.shape[1]
+
+        # CLIP 임베딩은 이미 L2 normalize되어 있으므로
+        # Inner Product 검색은 cosine similarity 검색과 같은 의미로 사용할 수 있다.
+        index = faiss.IndexFlatIP(dimension)
+        index.add(self.clip_text_embeddings.astype(np.float32))
+
+        faiss.write_index(index, str(self.faiss_index_path))
+        self.faiss_index = index
+
+        print(f"[FAISS] IndexFlatIP 저장 완료: {self.faiss_index_path}")
+
+
+    def _search_clip_faiss(self, query_text: str, top_k: int) -> list[dict[str, Any]]:
+        if self.faiss_index is None:
+            self.load_model(method="clip_faiss", rebuild=False)
+
+        assert self.products is not None
+        assert self.faiss_index is not None
+
+        top_k = min(top_k, len(self.products))
+
+        query_embedding = self._encode_texts_clip([query_text]).astype(np.float32)
+
+        scores, indices = self.faiss_index.search(query_embedding, top_k)
+
+        return self._format_results(indices[0], scores[0])
+
     def _encode_texts_clip(self, texts: list[str]) -> np.ndarray:
         if self.clip_model is None or self.clip_processor is None:
             self._load_clip_model()
@@ -221,6 +268,8 @@ class SearchEngine:
             results = self._search_tfidf(query_text=query_text, top_k=top_k)
         elif method == "clip":
             results = self._search_clip(query_text=query_text, top_k=top_k)
+        elif method == "clip_faiss":
+            results = self._search_clip_faiss(query_text=query_text, top_k=top_k)
         else:
             raise ValueError(f"지원하지 않는 method입니다: {method}")
 
@@ -274,13 +323,28 @@ class SearchEngine:
         assert self.products is not None
 
         results = []
-        for idx in indices:
-            row = self.products.iloc[int(idx)]
+
+        for rank_pos, idx in enumerate(indices):
+            idx = int(idx)
+
+            # FAISS에서 검색 실패 시 -1이 나올 수 있어서 방어
+            if idx < 0 or idx >= len(self.products):
+                continue
+
+            row = self.products.iloc[idx]
+
+            # 일반 numpy 검색: scores 길이 == 전체 상품 수
+            # FAISS 검색: scores 길이 == top_k
+            if len(scores) == len(indices):
+                score = float(scores[rank_pos])
+            else:
+                score = float(scores[idx])
+
             results.append(
                 {
                     "product_id": str(row["product_id"]),
                     "name": str(row["name"]),
-                    "score": float(round(float(scores[int(idx)]), 6)),
+                    "score": float(round(score, 6)),
                     "price": int(row["price"]),
                     "category_L1": str(row["category_L1"]),
                     "category_L2": str(row["category_L2"]),
@@ -288,6 +352,7 @@ class SearchEngine:
                     "price_tier": str(row["price_tier"]),
                 }
             )
+
         return results
 
 

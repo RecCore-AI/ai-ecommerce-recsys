@@ -18,6 +18,18 @@ def print_results(response: dict) -> None:
         )
 
 
+def run_method(engine: SearchEngine, method: str, queries: list[str]) -> None:
+    title = method.upper()
+    print(f"\n\n==================== {title} SEARCH ====================")
+
+    engine.load_model(method=method, rebuild=False)
+
+    for query in queries:
+        print(f"\n\nQuery: {query}")
+        response = engine.search(query_text=query, top_k=10, method=method)
+        print_results(response)
+
+
 def main() -> None:
     engine = SearchEngine(
         products_path="simulator/data/products.csv",
@@ -35,19 +47,9 @@ def main() -> None:
         "전자제품 PC 모니터 high",
     ]
 
-    print("\n\n==================== TF-IDF BASELINE ====================")
-    engine.load_model(method="tfidf", rebuild=False)
-    for query in queries:
-        print(f"\n\nQuery: {query}")
-        response = engine.search(query_text=query, top_k=10, method="tfidf")
-        print_results(response)
-
-    print("\n\n==================== CLIP TEXT SEARCH ====================")
-    engine.load_model(method="clip", rebuild=False)
-    for query in queries:
-        print(f"\n\nQuery: {query}")
-        response = engine.search(query_text=query, top_k=10, method="clip")
-        print_results(response)
+    run_method(engine, "tfidf", queries)
+    run_method(engine, "clip", queries)
+    run_method(engine, "clip_faiss", queries)
 
 
 if __name__ == "__main__":

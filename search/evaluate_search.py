@@ -172,6 +172,14 @@ def main() -> None:
         max_eval=1000,
     )
 
+    evaluate_method(
+        engine=engine,
+        products=products,
+        search_logs=search_logs,
+        method="clip_faiss",
+        max_eval=1000,
+    )
+
 
 if __name__ == "__main__":
     main()
