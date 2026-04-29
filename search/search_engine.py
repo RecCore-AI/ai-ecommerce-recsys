@@ -27,7 +27,11 @@ class SearchEngine:
         self.matrix_path = self.artifacts_dir / "baseline_matrix.npy"
         self.clip_embeddings_path = self.artifacts_dir / "clip_text_embeddings.npy"
         self.faiss_index_path = self.artifacts_dir / "clip_text_flat.index"
+        self.faiss_ivfpq_index_path = self.artifacts_dir / "clip_text_ivfpq.index"
+
         self.faiss_index = None
+        self.faiss_ivfpq_index = None
+        self.faiss_ivfpq_nprobe = 8
 
         self.clip_model_name = clip_model_name
         self.device = device
@@ -89,6 +93,11 @@ class SearchEngine:
             self._load_clip_model()
             self._load_or_build_clip_embeddings(rebuild=rebuild)
             self._load_or_build_faiss_index(rebuild=rebuild)
+
+        elif method == "clip_faiss_ivfpq":
+            self._load_clip_model()
+            self._load_or_build_clip_embeddings(rebuild=rebuild)
+            self._load_or_build_faiss_ivfpq_index(rebuild=rebuild)
         else:
             raise ValueError(f"지원하지 않는 method입니다: {method}")
 
@@ -185,6 +194,66 @@ class SearchEngine:
 
         print(f"[FAISS] IndexFlatIP 저장 완료: {self.faiss_index_path}")
 
+    def _load_or_build_faiss_ivfpq_index(
+        self,
+        rebuild: bool = False,
+        nlist: int = 100,
+        m: int = 16,
+        nbits: int = 8,
+        nprobe: int = 8,
+    ) -> None:
+        if self.clip_text_embeddings is None:
+            self._load_or_build_clip_embeddings(rebuild=False)
+
+        assert self.clip_text_embeddings is not None
+
+        import faiss
+
+        self.faiss_ivfpq_nprobe = nprobe
+
+        if not rebuild and self.faiss_ivfpq_index_path.exists():
+            self.faiss_ivfpq_index = faiss.read_index(str(self.faiss_ivfpq_index_path))
+            self.faiss_ivfpq_index.nprobe = nprobe
+            return
+
+        embeddings = self.clip_text_embeddings.astype(np.float32)
+        num_vectors, dimension = embeddings.shape
+
+        if dimension % m != 0:
+            raise ValueError(
+                f"IVFPQ의 m은 embedding dimension을 나누어떨어지게 해야 합니다. "
+                f"dimension={dimension}, m={m}"
+            )
+
+        # 데이터가 너무 적으면 nlist를 자동으로 줄인다.
+        nlist = min(nlist, max(1, int(np.sqrt(num_vectors))))
+
+        # IVF의 coarse quantizer
+        quantizer = faiss.IndexFlatIP(dimension)
+
+        # CLIP embedding은 L2 normalize되어 있으므로 Inner Product는 cosine similarity처럼 사용 가능
+        index = faiss.IndexIVFPQ(
+            quantizer,
+            dimension,
+            nlist,
+            m,
+            nbits,
+            faiss.METRIC_INNER_PRODUCT,
+        )
+
+        print(
+            f"[FAISS-IVFPQ] 인덱스 학습 시작: "
+            f"vectors={num_vectors}, dim={dimension}, nlist={nlist}, m={m}, nbits={nbits}"
+        )
+
+        index.train(embeddings)
+        index.add(embeddings)
+        index.nprobe = nprobe
+
+        faiss.write_index(index, str(self.faiss_ivfpq_index_path))
+        self.faiss_ivfpq_index = index
+
+        print(f"[FAISS-IVFPQ] 인덱스 저장 완료: {self.faiss_ivfpq_index_path}")
 
     def _search_clip_faiss(self, query_text: str, top_k: int) -> list[dict[str, Any]]:
         if self.faiss_index is None:
@@ -198,6 +267,21 @@ class SearchEngine:
         query_embedding = self._encode_texts_clip([query_text]).astype(np.float32)
 
         scores, indices = self.faiss_index.search(query_embedding, top_k)
+
+        return self._format_results(indices[0], scores[0])
+
+    def _search_clip_faiss_ivfpq(self, query_text: str, top_k: int) -> list[dict[str, Any]]:
+        if self.faiss_ivfpq_index is None:
+            self.load_model(method="clip_faiss_ivfpq", rebuild=False)
+
+        assert self.products is not None
+        assert self.faiss_ivfpq_index is not None
+
+        top_k = min(top_k, len(self.products))
+
+        query_embedding = self._encode_texts_clip([query_text]).astype(np.float32)
+
+        scores, indices = self.faiss_ivfpq_index.search(query_embedding, top_k)
 
         return self._format_results(indices[0], scores[0])
 
@@ -270,6 +354,8 @@ class SearchEngine:
             results = self._search_clip(query_text=query_text, top_k=top_k)
         elif method == "clip_faiss":
             results = self._search_clip_faiss(query_text=query_text, top_k=top_k)
+        elif method == "clip_faiss_ivfpq":
+            results = self._search_clip_faiss_ivfpq(query_text=query_text, top_k=top_k)
         else:
             raise ValueError(f"지원하지 않는 method입니다: {method}")
 

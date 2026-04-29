@@ -50,6 +50,7 @@ def main() -> None:
     run_method(engine, "tfidf", queries)
     run_method(engine, "clip", queries)
     run_method(engine, "clip_faiss", queries)
+    run_method(engine, "clip_faiss_ivfpq", queries)
 
 
 if __name__ == "__main__":
