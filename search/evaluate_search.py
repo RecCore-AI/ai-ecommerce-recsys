@@ -8,18 +8,55 @@ import pandas as pd
 from search_engine import SearchEngine
 
 
-def reciprocal_rank(results: list[dict], relevant_product_id: str) -> float:
+def exact_mrr(results: list[dict], relevant_product_id: str) -> float:
     for rank, item in enumerate(results, start=1):
         if item["product_id"] == relevant_product_id:
             return 1.0 / rank
     return 0.0
 
 
-def ndcg_at_k(results: list[dict], relevant_product_id: str, k: int = 10) -> float:
+def exact_ndcg_at_k(results: list[dict], relevant_product_id: str, k: int = 10) -> float:
     for rank, item in enumerate(results[:k], start=1):
         if item["product_id"] == relevant_product_id:
             return 1.0 / math.log2(rank + 1)
     return 0.0
+
+
+def same_group(item: dict, target: pd.Series) -> bool:
+    return (
+        item["category_L1"] == target["category_L1"]
+        and item["category_L2"] == target["category_L2"]
+        and item["category_L3"] == target["category_L3"]
+        and item["price_tier"] == target["price_tier"]
+    )
+
+
+def category_hit_at_k(results: list[dict], target: pd.Series, k: int = 10) -> float:
+    for item in results[:k]:
+        if same_group(item, target):
+            return 1.0
+    return 0.0
+
+
+def category_mrr(results: list[dict], target: pd.Series) -> float:
+    for rank, item in enumerate(results, start=1):
+        if same_group(item, target):
+            return 1.0 / rank
+    return 0.0
+
+
+def category_ndcg_at_k(results: list[dict], target: pd.Series, k: int = 10) -> float:
+    dcg = 0.0
+    for rank, item in enumerate(results[:k], start=1):
+        if same_group(item, target):
+            dcg += 1.0 / math.log2(rank + 1)
+
+    ideal_relevant_count = min(k, len(results))
+    idcg = sum(1.0 / math.log2(rank + 1) for rank in range(1, ideal_relevant_count + 1))
+
+    if idcg == 0:
+        return 0.0
+    return dcg / idcg
 
 
 def make_query_from_product(row: pd.Series) -> str:
@@ -34,11 +71,6 @@ def make_query_from_product(row: pd.Series) -> str:
 def main() -> None:
     products_path = Path("simulator/data/products.csv")
     test_logs_path = Path("simulator/data/test_logs.csv")
-
-    if not products_path.exists():
-        raise FileNotFoundError(f"products.csv 없음: {products_path}")
-    if not test_logs_path.exists():
-        raise FileNotFoundError(f"test_logs.csv 없음: {test_logs_path}")
 
     products = pd.read_csv(products_path)
     test_logs = pd.read_csv(test_logs_path)
@@ -57,11 +89,15 @@ def main() -> None:
     engine.load_products()
     engine.load_model(rebuild=False)
 
-    mrr_scores = []
-    ndcg_scores = []
+    exact_mrr_scores = []
+    exact_ndcg_scores = []
+
+    category_hit_scores = []
+    category_mrr_scores = []
+    category_ndcg_scores = []
+
     latency_list = []
 
-    # 너무 많으면 오래 걸릴 수 있으므로 처음에는 1000개만 평가
     max_eval = min(1000, len(search_logs))
     eval_logs = search_logs.head(max_eval)
 
@@ -73,29 +109,41 @@ def main() -> None:
         if product_id not in product_map.index:
             continue
 
-        product_row = product_map.loc[product_id]
-        query = make_query_from_product(product_row)
+        target_product = product_map.loc[product_id]
+        query = make_query_from_product(target_product)
 
         response = engine.search(query_text=query, top_k=10)
         results = response["results"]
 
-        mrr_scores.append(reciprocal_rank(results, product_id))
-        ndcg_scores.append(ndcg_at_k(results, product_id, k=10))
+        exact_mrr_scores.append(exact_mrr(results, product_id))
+        exact_ndcg_scores.append(exact_ndcg_at_k(results, product_id, k=10))
+
+        category_hit_scores.append(category_hit_at_k(results, target_product, k=10))
+        category_mrr_scores.append(category_mrr(results, target_product))
+        category_ndcg_scores.append(category_ndcg_at_k(results, target_product, k=10))
+
         latency_list.append(response["latency_ms"])
         valid_count += 1
 
     if valid_count == 0:
         raise ValueError("평가 가능한 search 로그가 없습니다.")
 
-    mrr = sum(mrr_scores) / len(mrr_scores)
-    ndcg = sum(ndcg_scores) / len(ndcg_scores)
+    print("\n========== Search Baseline Evaluation ==========")
+    print(f"eval_count: {valid_count}")
+
+    print("\n[Exact Product ID Evaluation]")
+    print(f"MRR: {sum(exact_mrr_scores) / len(exact_mrr_scores):.4f}")
+    print(f"NDCG@10: {sum(exact_ndcg_scores) / len(exact_ndcg_scores):.4f}")
+
+    print("\n[Category/Price-Tier Evaluation]")
+    print(f"Category HitRate@10: {sum(category_hit_scores) / len(category_hit_scores):.4f}")
+    print(f"Category MRR: {sum(category_mrr_scores) / len(category_mrr_scores):.4f}")
+    print(f"Category NDCG@10: {sum(category_ndcg_scores) / len(category_ndcg_scores):.4f}")
+
     avg_latency = sum(latency_list) / len(latency_list)
     p95_latency = sorted(latency_list)[int(len(latency_list) * 0.95) - 1]
 
-    print("\n========== Search Baseline Evaluation ==========")
-    print(f"eval_count: {valid_count}")
-    print(f"MRR: {mrr:.4f}")
-    print(f"NDCG@10: {ndcg:.4f}")
+    print("\n[Latency]")
     print(f"avg_latency_ms: {avg_latency:.3f}")
     print(f"p95_latency_ms: {p95_latency:.3f}")
 
