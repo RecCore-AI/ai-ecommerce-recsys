@@ -110,15 +110,41 @@ abandoned_carts = purchase_logs.sample(frac=0.5).copy()
 abandoned_carts['product_id'] = np.random.choice('P' + final_articles['article_id'], size=len(abandoned_carts))
 abandoned_carts['event_type'] = 'cart'
 
-# 모든 로그 병합 및 시간 순서 섞기 (Shuffle)
+# ---------------------------------------------------------
+# 모든 로그 병합 후 시간순 정렬 (Shuffle 제거 → 시간 기반 분할을 위해)
+# ---------------------------------------------------------
 logs = pd.concat([
-    purchase_logs, 
-    cart_for_purchase, 
-    view_for_purchase, 
-    bounced_views, 
+    purchase_logs,
+    cart_for_purchase,
+    view_for_purchase,
+    bounced_views,
     abandoned_carts
-]).sample(frac=1).reset_index(drop=True)
+])
 
-logs.to_csv('data/train_logs.csv', index=False)
+logs['timestamp'] = pd.to_datetime(logs['timestamp'])
+logs = logs.sort_values('timestamp').reset_index(drop=True)
 
-print(f"✅ 실제 현업 수준의 데이터 전처리 및 증강 완료! 총 {len(logs)}건의 로그가 생성되었습니다.")
+# ---------------------------------------------------------
+# 💾 3. 시간 기반 Train / Valid / Test 분할 (8:1:1)
+# 명세: "최근 데이터를 test로 배정" (시간 기반 분할 권장)
+# ---------------------------------------------------------
+print("3-2. 시간 기반 Train/Valid/Test (8:1:1) 분할 중...")
+
+train_cutoff = logs['timestamp'].quantile(0.8)
+valid_cutoff = logs['timestamp'].quantile(0.9)
+
+train_logs = logs[logs['timestamp'] <= train_cutoff]
+valid_logs = logs[(logs['timestamp'] > train_cutoff) & (logs['timestamp'] <= valid_cutoff)]
+test_logs  = logs[logs['timestamp'] > valid_cutoff]
+
+train_logs.to_csv('data/train_logs.csv', index=False)
+valid_logs.to_csv('data/valid_logs.csv', index=False)
+test_logs.to_csv('data/test_logs.csv', index=False)
+# [역할 4 담당자에게]
+# phase4_offline_eval.py가 현재 train_logs.csv에서 평가 샘플을 뽑고 있음.
+# 분할 이후에는 반드시 test_logs.csv를 사용하도록 경로를 수정해야 함.
+
+print(f"  Train  : {len(train_logs):,}건  ({train_logs['timestamp'].min().date()} ~ {train_logs['timestamp'].max().date()})")
+print(f"  Valid  : {len(valid_logs):,}건  ({valid_logs['timestamp'].min().date()} ~ {valid_logs['timestamp'].max().date()})")
+print(f"  Test   : {len(test_logs):,}건  ({test_logs['timestamp'].min().date()} ~ {test_logs['timestamp'].max().date()})")
+print(f"✅ 데이터 전처리 및 분할 완료! 총 {len(logs):,}건 → train/valid/test 저장")
