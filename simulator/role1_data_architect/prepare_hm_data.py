@@ -142,7 +142,7 @@ valid_logs.to_csv('data/valid_logs.csv', index=False)
 test_logs.to_csv('data/test_logs.csv', index=False)
 # [역할 4 담당자에게]
 # phase4_offline_eval.py가 현재 train_logs.csv에서 평가 샘플을 뽑고 있음.
-# 분할 이후에는 반드시 test_logs.csv를 사용하도록 경로를 수정해야 함.
+# 분할 이후에는 반드시 test_logs.csv를 사용하도록 경로를 수정해야 함. 
 
 print(f"  Train  : {len(train_logs):,}건  ({train_logs['timestamp'].min().date()} ~ {train_logs['timestamp'].max().date()})")
 print(f"  Valid  : {len(valid_logs):,}건  ({valid_logs['timestamp'].min().date()} ~ {valid_logs['timestamp'].max().date()})")
