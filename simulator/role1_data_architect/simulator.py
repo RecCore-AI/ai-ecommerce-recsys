@@ -42,14 +42,8 @@ if not os.path.exists(LOG_FILE):
         f.write("user_id,product_id,event_type,timestamp\n")
 
 def post_event(user_id: str, product_id: str, event_type: str, timestamp: int) -> None:
-    payload = {
-        "user_id":    user_id,
-        "product_id": product_id,
-        "event_type": event_type,
-        "timestamp":  timestamp,
-    }
     try:
-        requests.post(API_URL, json=payload, timeout=1)
+        requests.post(API_URL, data={"user_id": user_id, "item_id": product_id}, timeout=1)
     except requests.exceptions.RequestException:
         pass
     with open(LOG_FILE, "a", encoding="utf-8") as f:
