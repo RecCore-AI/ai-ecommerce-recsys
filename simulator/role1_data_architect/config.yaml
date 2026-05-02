@@ -4,7 +4,7 @@
 
 # [역할 4 담당자에게] 엔드포인트 합의 후 아래 값을 수정
 api:
-  log_endpoint: "http://api-server:8000/api/log"
+  log_endpoint: "http://api-server:8000/api/click"
 
 # 트래픽 분배 비율 (현실적인 고객 분포)
 persona_ratios:
