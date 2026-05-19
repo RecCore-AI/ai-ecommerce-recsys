@@ -20,7 +20,7 @@ model = CLIPModel.from_pretrained(model_id).to(device)
 model.eval() # 평가 모드
 
 # 3. 💡 [핵심 수정] 실제 H&M 이미지 로드 함수
-def load_hm_image(product_id):
+def load_hm_image(product_id: str) -> Image.Image:
     """실제 H&M 데이터셋의 폴더 구조에서 이미지를 불러옵니다."""
     raw_id = product_id[1:]  # 'P0108775015' -> '0108775015' 추출
     folder_prefix = raw_id[:3]  # 앞 3자리가 하위 폴더명
@@ -34,7 +34,7 @@ def load_hm_image(product_id):
         return Image.new('RGB', (224, 224), (0, 0, 0))
 
 # 4. 임베딩 추출 및 FAISS 인덱싱 메인 로직
-def build_multimodal_index():
+def build_multimodal_index() -> None:
     print("상품 메타데이터 로드 중...")
     df_prod = pd.read_csv('data/products.csv')
     

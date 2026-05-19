@@ -35,7 +35,6 @@ from fastapi import FastAPI, UploadFile, File, Form, Query
 from pydantic import BaseModel
 from typing import Optional, Literal
 from transformers import CLIPProcessor, CLIPModel
-from deep_translator import GoogleTranslator
 from PIL import Image
 from sklearn.preprocessing import LabelEncoder
 
@@ -44,6 +43,7 @@ from sklearn.preprocessing import LabelEncoder
 # ──────────────────────────────────────────────
 DATA_DIR        = "data"
 TEXT_INDEX_PATH = f"{DATA_DIR}/indices/text.index"
+IMAGE_INDEX_PATH = f"{DATA_DIR}/indices/image.index"
 CAND_INDEX_PATH = f"{DATA_DIR}/indices/candidate_item.index"
 DEEPFM_PATH     = f"{DATA_DIR}/models/deepfm.pth"
 TT_PATH         = f"{DATA_DIR}/models/two_tower.pth"
@@ -64,7 +64,7 @@ app = FastAPI(title="Multi-Stage Recommender API")
 # 모델 정의 (학습 코드와 정확히 동일해야 함)
 # ──────────────────────────────────────────────
 class DeepFM(nn.Module):
-    def __init__(self, feature_dims, embedding_dim=16):
+    def __init__(self, feature_dims, embedding_dim=24):  # v8c: 16 → 24
         super().__init__()
         self.sparse_features = list(feature_dims.keys())
         self.embeddings = nn.ModuleDict({f: nn.Embedding(d, embedding_dim) for f, d in feature_dims.items()})
@@ -86,22 +86,49 @@ class DeepFM(nn.Module):
 
 
 class TwoTowerModel(nn.Module):
-    def __init__(self, n_users, n_prods, n_persona, n_cat1, n_cat2, n_cat3, n_tier, emb_dim=32, out_dim=64):
+    def __init__(self, n_users, n_prods, n_persona, n_cat1, n_cat2, n_cat3, n_tier,
+                 n_activity=3, user_dim=64, item_dim=64, side_dim=16, out_dim=64, seq_len=10):
         super().__init__()
-        self.user_emb    = nn.Embedding(n_users,   emb_dim)
-        self.persona_emb = nn.Embedding(n_persona, emb_dim)
-        self.user_mlp = nn.Sequential(nn.Linear(emb_dim * 2, 128), nn.ReLU(), nn.Linear(128, out_dim))
-        
-        self.item_emb = nn.Embedding(n_prods, emb_dim)
-        self.cat1_emb = nn.Embedding(n_cat1, emb_dim)
-        self.cat2_emb = nn.Embedding(n_cat2, emb_dim)
-        self.cat3_emb = nn.Embedding(n_cat3, emb_dim)
-        self.tier_emb = nn.Embedding(n_tier, emb_dim)
-        self.item_mlp = nn.Sequential(nn.Linear(emb_dim * 5, 128), nn.ReLU(), nn.Linear(128, out_dim))
+        self.user_emb     = nn.Embedding(n_users, user_dim)
+        self.persona_emb  = nn.Embedding(n_persona, side_dim)
+        self.activity_emb = nn.Embedding(n_activity, side_dim)
+
+        self.item_emb = nn.Embedding(n_prods, item_dim)
+        self.cat2_emb = nn.Embedding(n_cat2, side_dim)
+        self.cat3_emb = nn.Embedding(n_cat3, side_dim)
+
+        # SHARED
+        self.cat1_emb = nn.Embedding(n_cat1, side_dim)
+        self.tier_emb = nn.Embedding(n_tier, side_dim)
+
+        # v8: 시퀀스 인코더
+        self.seq_len    = seq_len
+        self.seq_hidden = item_dim
+        self.seq_gru    = nn.GRU(item_dim, self.seq_hidden, batch_first=True)
+        self.register_buffer("user_seq", torch.zeros(n_users, seq_len, dtype=torch.long))
+
+        user_in = user_dim + side_dim * 4 + self.seq_hidden
+        item_in = item_dim + side_dim * 4
+        self.user_mlp = nn.Sequential(nn.Linear(user_in, 128), nn.ReLU(), nn.Linear(128, out_dim))
+        self.item_mlp = nn.Sequential(nn.Linear(item_in, 128), nn.ReLU(), nn.Linear(128, out_dim))
         self.out_dim  = out_dim
 
-    def encode_user(self, u_idx, persona_idx):
-        x = torch.cat([self.user_emb(u_idx), self.persona_emb(persona_idx)], dim=-1)
+    def encode_user(self, u_idx, persona_idx, cat1_dist, tier_dist, activity_idx):
+        seq = self.user_seq[u_idx]
+        seq_emb = self.item_emb(seq)
+        _, h = self.seq_gru(seq_emb)
+        seq_vec = h.squeeze(0)
+
+        cat_pref  = cat1_dist @ self.cat1_emb.weight
+        tier_pref = tier_dist @ self.tier_emb.weight
+        x = torch.cat([
+            self.user_emb(u_idx),
+            self.persona_emb(persona_idx),
+            cat_pref,
+            tier_pref,
+            self.activity_emb(activity_idx),
+            seq_vec,
+        ], dim=-1)
         return F.normalize(self.user_mlp(x), p=2, dim=-1)
 
     def encode_item(self, p_idx, cat1_idx, cat2_idx, cat3_idx, tier_idx):
@@ -154,6 +181,7 @@ print("🚀 [1/5] CLIP & 텍스트 FAISS 로드...")
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 clip_model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device).eval()
 text_faiss     = faiss.read_index(TEXT_INDEX_PATH)
+image_faiss    = faiss.read_index(IMAGE_INDEX_PATH) if os.path.exists(IMAGE_INDEX_PATH) else text_faiss
 
 print("🚀 [2/5] 메타데이터 로드...")
 df_prods = pd.read_csv(f"{DATA_DIR}/products.csv")
@@ -189,41 +217,95 @@ except Exception:
 print(f"  인기 상품 {len(popular_pids)} / 트렌딩 {len(trending_pids)} / 신규 {len(new_pids)}")
 
 print("🚀 [3/5] DeepFM 인코더/모델 로드...")
-SPARSE_FEATURES = ['user_id', 'product_id', 'persona', 'category_L1', 'category_L2', 'category_L3', 'price_tier']
+# feature schema 는 학습(phase2_deepfm.py)이 저장한 파일을 그대로 사용한다.
+# → SPARSE_FEATURES / feature_dims 가 deepfm.pth 와 불일치하면 load_state_dict 가
+#   실패하므로, 하드코딩 대신 schema 를 단일 진실 공급원으로 삼는다. (v7a 피처 15개 포함)
+with open(f"{DATA_DIR}/models/deepfm_feature_schema.json", "r", encoding="utf-8") as f:
+    _schema = json.load(f)
+SPARSE_FEATURES = _schema["sparse_features"]
+feature_dims    = {feat: _schema["feature_dims"][feat] for feat in SPARSE_FEATURES}
+
+# v7a cross feature lookup: train_logs 기준 재계산 (phase2_deepfm.py 와 동일)
+pid_global_count = df_logs.groupby("product_id").size().to_dict()
+_logs_cat3 = df_logs.merge(df_prods[["product_id", "category_L3"]], on="product_id")
+user_cat3_count = _logs_cat3.groupby(["user_id", "category_L3"]).size().to_dict()
+
 encoders = {}
-temp = df_logs.merge(df_users, on="user_id").merge(df_prods, on="product_id")
 for f in SPARSE_FEATURES:
     le = LabelEncoder()
-    temp[f] = le.fit_transform(temp[f].astype(str))
+    if f == "product_id":
+        le.fit(df_prods["product_id"].astype(str).values)
+    elif f in ["category_L1", "category_L2", "category_L3", "price_tier"]:
+        le.fit(df_prods[f].astype(str).values)
+    elif f == "user_pid_prev":
+        le.fit(np.array(["0", "1", "2", "3"]))
+    elif f == "user_activity":
+        le.fit(np.array(["0", "1", "2"]))
+    elif f in ["cat3_match", "tier_match", "dow_weekend"]:
+        le.fit(np.array(["0", "1"]))
+    elif f == "hour_bin":
+        le.fit(np.array(["0", "1", "2", "3"]))
+    elif f in ["pid_popularity", "user_cat3_view"]:
+        le.fit(np.array(["0", "1", "2", "3", "4"]))
+    elif f == "persona":
+        le.fit(df_users["persona"].astype(str).values)
+    else:  # user_id
+        le.fit(df_users["user_id"].astype(str).values)
     encoders[f] = le
-feature_dims = {f: len(encoders[f].classes_) for f in SPARSE_FEATURES}
+
+# {원본값 → 인덱스} 사전 계산 — 요청마다 np.isin(50k 클래스 정렬)을 반복하지 않도록 (latency 최적화)
+encoder_maps = {f: {c: i for i, c in enumerate(encoders[f].classes_)} for f in SPARSE_FEATURES}
 
 deepfm = DeepFM(feature_dims).to(device)
 deepfm.load_state_dict(torch.load(DEEPFM_PATH, map_location=device))
 deepfm.eval()
+
+# v7: cross feature lookup 로드 (phase2_deepfm.py 가 저장)
+pair_counts_dict = {}
+user_top_cat3 = {}
+user_top_tier = {}
+user_activity_lookup = {}
+try:
+    pair_df = pd.read_csv(f"{DATA_DIR}/models/deepfm_pair_counts.csv")
+    pair_counts_dict = dict(zip(zip(pair_df["user_id"], pair_df["product_id"]), pair_df["cnt"]))
+    user_lookup_df = pd.read_csv(f"{DATA_DIR}/models/deepfm_user_lookup.csv")
+    user_top_cat3 = dict(zip(user_lookup_df["user_id"], user_lookup_df["top_cat3"]))
+    user_top_tier = dict(zip(user_lookup_df["user_id"], user_lookup_df["top_tier"]))
+    user_activity_lookup = dict(zip(user_lookup_df["user_id"], user_lookup_df["user_activity"]))
+    print(f"  cross feature lookup 로드: pairs={len(pair_counts_dict):,}, users={len(user_top_cat3):,}")
+except Exception as e:
+    print(f"  [WARN] cross lookup 로드 실패: {e}")
 
 print("🚀 [4/5] Two-Tower 로드...")
 two_tower = None
 candidate_faiss = None
 user_idx_map = {}
 user_persona_map = {}
+user_activity_map = {}
 prod_idx_map = {}
 prod_idx_to_id = {}
+user_cat1_dist_arr = None  # (num_users, num_cat1)
+user_tier_dist_arr = None  # (num_users, num_tier)
 
 if os.path.exists(TT_PATH) and os.path.exists(CAND_INDEX_PATH):
     ckpt = torch.load(TT_PATH, map_location=device)
-    
-    # 여기서 카테고리 1, 2, 3을 각각 불러오도록 수정됨!
+
     two_tower = TwoTowerModel(
-        n_users=ckpt["num_users"], 
+        n_users=ckpt["num_users"],
         n_prods=ckpt["num_prods"],
-        n_persona=ckpt["num_persona"], 
-        n_cat1=ckpt["num_cat1"], 
-        n_cat2=ckpt["num_cat2"], 
-        n_cat3=ckpt["num_cat3"], 
+        n_persona=ckpt["num_persona"],
+        n_cat1=ckpt["num_cat1"],
+        n_cat2=ckpt["num_cat2"],
+        n_cat3=ckpt["num_cat3"],
         n_tier=ckpt["num_tier"],
+        n_activity=ckpt.get("num_activity", 3),
+        user_dim=ckpt.get("user_dim", 32),
+        item_dim=ckpt.get("item_dim", 32),
+        side_dim=ckpt.get("side_dim", 32),
+        out_dim=ckpt.get("out_dim", 64),
+        seq_len=ckpt.get("seq_len", 10),
     ).to(device)
-    
+
     two_tower.load_state_dict(ckpt["state_dict"])
     two_tower.eval()
     candidate_faiss = faiss.read_index(CAND_INDEX_PATH)
@@ -231,9 +313,18 @@ if os.path.exists(TT_PATH) and os.path.exists(CAND_INDEX_PATH):
     user_map = pd.read_csv(f"{DATA_DIR}/models/two_tower_user_map.csv")
     user_idx_map     = dict(zip(user_map["user_id"], user_map["user_idx"]))
     user_persona_map = dict(zip(user_map["user_id"], user_map["persona_idx"]))
+    if "activity_idx" in user_map.columns:
+        user_activity_map = dict(zip(user_map["user_id"], user_map["activity_idx"]))
     prod_map = pd.read_csv(f"{DATA_DIR}/models/two_tower_prod_map.csv")
     prod_idx_map     = dict(zip(prod_map["product_id"], prod_map["prod_idx"]))
     prod_idx_to_id   = {v: k for k, v in prod_idx_map.items()}
+
+    cat1_path = f"{DATA_DIR}/models/two_tower_user_cat1_dist.npy"
+    tier_path = f"{DATA_DIR}/models/two_tower_user_tier_dist.npy"
+    if os.path.exists(cat1_path) and os.path.exists(tier_path):
+        user_cat1_dist_arr = np.load(cat1_path).astype(np.float32)
+        user_tier_dist_arr = np.load(tier_path).astype(np.float32)
+        print(f"  ✅ 유저 행동 분포 로드: cat1 {user_cat1_dist_arr.shape}, tier {user_tier_dist_arr.shape}")
     print("  ✅ Two-Tower + FAISS IndexIDMap 로드")
 
 print("🚀 [5/5] 세션 GRU 초기화...")
@@ -243,6 +334,8 @@ if two_tower is not None:
 
 # 빠른 조회용
 prod_meta_dict = df_prods.set_index("product_id").to_dict("index")
+prod_cat3_map = {pid: m.get("category_L3") for pid, m in prod_meta_dict.items()}
+prod_tier_map = {pid: m.get("price_tier")  for pid, m in prod_meta_dict.items()}
 user_persona_str = df_users.set_index("user_id")["persona"].to_dict()
 all_pids_set = set(df_prods["product_id"].values)
 
@@ -252,13 +345,72 @@ print("✅ 서버 준비 완료!")
 # ──────────────────────────────────────────────
 # 헬퍼
 # ──────────────────────────────────────────────
+def _pid_prev_bin(c: int) -> int:
+    if c == 0: return 0
+    if c == 1: return 1
+    if c == 2: return 2
+    return 3
+
+
+def _hour_bin(h: int) -> int:
+    if h < 6:  return 0
+    if h < 12: return 1
+    if h < 18: return 2
+    return 3
+
+
+def _pop_bin(c: int) -> int:
+    """v7a: product 인기도 binning (phase2_deepfm.py pop_bin 과 동일)."""
+    if c < 5:   return 0
+    if c < 20:  return 1
+    if c < 100: return 2
+    if c < 500: return 3
+    return 4
+
+
+def _cat3_view_bin(c: int) -> int:
+    """v7a: user-cat3 view 카운트 binning (phase2_deepfm.py cat3_view_bin 과 동일)."""
+    if c == 0:  return 0
+    if c < 5:   return 1
+    if c < 20:  return 2
+    if c < 100: return 3
+    return 4
+
+
+def _add_cross_context(df: pd.DataFrame) -> pd.DataFrame:
+    """v7: phase2_deepfm.py 와 동일한 cross/context feature 추가."""
+    df = df.copy()
+    pairs = list(zip(df["user_id"].values, df["product_id"].values))
+    df["user_pid_prev"] = [_pid_prev_bin(pair_counts_dict.get(k, 0)) for k in pairs]
+    df["user_activity"] = df["user_id"].map(user_activity_lookup).fillna(0).astype(int)
+    if "category_L3" not in df.columns:
+        df["category_L3"] = df["product_id"].map(prod_cat3_map).fillna("unknown")
+    df["cat3_match"] = (df["category_L3"].astype(str) ==
+                        df["user_id"].map(user_top_cat3).fillna("unknown").astype(str)).astype(int)
+    if "price_tier" not in df.columns:
+        df["price_tier"] = df["product_id"].map(prod_tier_map).fillna("medium")
+    df["tier_match"] = (df["price_tier"].astype(str) ==
+                        df["user_id"].map(user_top_tier).fillna("medium").astype(str)).astype(int)
+    now = datetime.now()
+    df["hour_bin"]    = _hour_bin(now.hour)
+    df["dow_weekend"] = int(now.weekday() >= 5)
+    # v7a: pid_popularity / user_cat3_view (phase2_deepfm.py 와 동일 계산)
+    df["pid_popularity"] = (
+        df["product_id"].map(pid_global_count).fillna(0).astype(int).map(_pop_bin)
+    )
+    uc_pairs = list(zip(df["user_id"].values, df["category_L3"].astype(str).values))
+    df["user_cat3_view"] = [_cat3_view_bin(user_cat3_count.get(k, 0)) for k in uc_pairs]
+    return df
+
+
 def encode_for_deepfm(df: pd.DataFrame) -> np.ndarray:
+    df = _add_cross_context(df)
     X = np.zeros((len(df), len(SPARSE_FEATURES)), dtype=int)
     for i, f in enumerate(SPARSE_FEATURES):
-        cls = encoders[f].classes_
-        v = df[f].astype(str).values
-        m = np.isin(v, cls)
-        X[m, i] = encoders[f].transform(v[m])
+        if f not in df.columns:
+            continue  # 컬럼 부재 → 전부 OOV(인덱스 0) 유지
+        # 사전계산 dict 로 매핑, 미등록(OOV) 값은 0 (기존 np.isin 방식과 동일 의미)
+        X[:, i] = df[f].astype(str).map(encoder_maps[f]).fillna(0).astype(int).to_numpy()
     return X
 
 
@@ -328,11 +480,9 @@ async def personalized_search(
     text_emb, image_emb = None, None
 
     if query:
-        try:
-            translated = GoogleTranslator(source="auto", target="en").translate(query)
-        except Exception:
-            translated = query
-        tok = clip_processor.tokenizer(translated, return_tensors="pt", padding=True, truncation=True, max_length=77).to(device)
+        # text.index 는 영문 product_name 으로 구축됨(phase1) — 평가(phase4)도 영문 쿼리로 측정.
+        # project.md line 403(외부 클라우드 API 금지) 준수 위해 외부 번역기 제거, 쿼리를 그대로 인코딩.
+        tok = clip_processor.tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=77).to(device)
         with torch.no_grad():
             tf = clip_model.get_text_features(input_ids=tok["input_ids"], attention_mask=tok["attention_mask"])
             if not isinstance(tf, torch.Tensor):
@@ -347,6 +497,10 @@ async def personalized_search(
         proc = clip_processor(images=[img], return_tensors="pt").to(device)
         with torch.no_grad():
             img_f = clip_model.get_image_features(pixel_values=proc["pixel_values"])
+            if not isinstance(img_f, torch.Tensor):
+                pooler = getattr(img_f, "pooler_output", None)
+                embeds = getattr(img_f, "image_embeds", None)
+                img_f = pooler if pooler is not None else embeds
             image_emb = img_f / img_f.norm(dim=-1, keepdim=True)
 
     # 검색 타입 결정
@@ -361,43 +515,36 @@ async def personalized_search(
         search_type = "image"
         final_emb = image_emb
 
-    # FAISS 검색
+    # FAISS 유사도 검색 — 검색은 "유사 상품 찾기" 이므로 유사도 순으로 정렬한다.
+    # image 전용 검색은 상품 이미지 임베딩(image.index), text/hybrid 는 text.index 사용.
+    # (개인화 재정렬은 추천 API 의 역할 — 검색에 적용하면 retrieve 정확도가 훼손됨)
+    search_index = image_faiss if search_type == "image" else text_faiss
     final_np = final_emb.cpu().numpy().astype("float32")
-    distances, indices = text_faiss.search(final_np, max(top_k * 5, 50))
-    candidate_ids = df_prods.iloc[indices[0]]["product_id"].values
-    candidate_df = df_prods[df_prods["product_id"].isin(candidate_ids)].copy()
+    distances, indices = search_index.search(final_np, top_k)
 
-    # DeepFM 개인화 랭킹
     user_info = df_users[df_users["user_id"] == user_id]
-    if user_info.empty:
-        results_df = candidate_df.head(top_k)
-        results_df = results_df.assign(score=1.0)
-        persona = "신규가입자"
-    else:
-        persona = user_info["persona"].values[0]
-        candidate_df["user_id"] = user_id
-        candidate_df["persona"] = persona
-        X_p = encode_for_deepfm(candidate_df)
-        with torch.no_grad():
-            scores = deepfm(torch.tensor(X_p, dtype=torch.long).to(device)).cpu().numpy()
-        candidate_df["score"] = scores
-        results_df = candidate_df.sort_values("score", ascending=False).head(top_k)
+    persona = user_info["persona"].values[0] if not user_info.empty else "신규가입자"
+
+    # 정규화 임베딩 → squared L2 거리를 코사인 유사도로 변환 (cos = 1 - d/2)
+    results = []
+    for dist, idx in zip(distances[0], indices[0]):
+        if idx < 0:
+            continue
+        prod = df_prods.iloc[int(idx)]
+        results.append({
+            "product_id": prod["product_id"],
+            "name":       prod["product_name"],
+            "score":      round(float(max(0.0, 1.0 - dist / 2.0)), 4),
+            "price":      int(prod["price"]),
+        })
 
     latency = round((time.perf_counter() - t0) * 1000, 1)
 
     return {
         "search_type": search_type,
-        "results": [
-            {
-                "product_id": r["product_id"],
-                "name":       r["product_name"],
-                "score":      float(r["score"]),
-                "price":      int(r["price"]),
-            }
-            for _, r in results_df.iterrows()
-        ],
+        "results": results,
         "latency_ms": latency,
-        "total_count": int(len(candidate_df)),
+        "total_count": len(results),
         "user_id": user_id,
         "persona": persona,
         "original_query": query,
@@ -446,10 +593,11 @@ async def recommend(
     recent_pids = get_session_recent_pids(user_id)
     history_count = len(recent_pids)
 
-    # 신규 유저 폴백
-    is_new_user = (persona is None) or (history_count < NEW_USER_HISTORY_THRESHOLD and user_info.empty)
-    # 명세에 따라 "행동 이력 5개 미만"을 폴백 조건으로 쓴다
-    cold_start = history_count < NEW_USER_HISTORY_THRESHOLD
+    # 신규 유저 판정 (명세 line 175: 행동 이력 5개 미만).
+    # 학습된 유저(Two-Tower vocab 에 존재)는 시뮬레이터가 최소 5개 이상 행동을 부여하므로 신규가 아니다.
+    # 미학습 user_id 이면서 세션 클릭도 5개 미만일 때만 콜드스타트로 본다.
+    is_known_user = user_id in user_idx_map
+    cold_start = (not is_known_user) and (history_count < NEW_USER_HISTORY_THRESHOLD)
 
     session_interest = None
     if recent_pids:
@@ -464,11 +612,19 @@ async def recommend(
 
     can_use_two_tower = (two_tower is not None) and (user_id in user_idx_map)
     if can_use_two_tower:
-        u_idx = torch.tensor([user_idx_map[user_id]], dtype=torch.long).to(device)
+        u_pos = int(user_idx_map[user_id])
+        u_idx = torch.tensor([u_pos], dtype=torch.long).to(device)
         p_idx = torch.tensor([user_persona_map[user_id]], dtype=torch.long).to(device)
+        a_idx = torch.tensor([int(user_activity_map.get(user_id, 0))], dtype=torch.long).to(device)
+        if user_cat1_dist_arr is not None:
+            cat1_d = torch.from_numpy(user_cat1_dist_arr[u_pos:u_pos+1]).to(device)
+            tier_d = torch.from_numpy(user_tier_dist_arr[u_pos:u_pos+1]).to(device)
+        else:
+            cat1_d = torch.zeros(1, two_tower.cat1_emb.num_embeddings, device=device)
+            tier_d = torch.zeros(1, two_tower.tier_emb.num_embeddings, device=device)
 
         with torch.no_grad():
-            u_vec = two_tower.encode_user(u_idx, p_idx)  # (1, D)
+            u_vec = two_tower.encode_user(u_idx, p_idx, cat1_d, tier_d, a_idx)  # (1, D)
 
             # 단기 관심(세션) ⊕ 장기 선호(User Tower)
             if session_encoder is not None and recent_pids:
@@ -526,32 +682,55 @@ async def recommend(
     # 1) 다양성 (동일 카테고리 연속 3개 금지)
     diverse_pids = diversity_rerank(ranked_pids)
 
-    # 2) 신규 상품 노출 부스팅: 후보에서 신규상품 1개를 상위 3 안에 강제 삽입
-    new_in_candidates = [p for p in diverse_pids if p in set(new_pids)]
-    if new_in_candidates and not cold_start:
-        boost = new_in_candidates[0]
-        diverse_pids.remove(boost)
-        diverse_pids.insert(min(2, len(diverse_pids)), boost)
+    # 2) Top-N 슬롯 구성: exploitation + 신규상품 보장 슬롯 + MAB 탐색 슬롯
+    new_pids_set = set(new_pids)
 
-    # 3) Top-N 자르기 + MAB 탐색 슬롯 (Epsilon-Greedy)
-    final_pids = diverse_pids[:max(top_n - 2, 1)]  # exploitation
-    explore_count = max(1, top_n - len(final_pids))  # 1~2개 탐색
-    explore_pool = [p for p in popular_pids + trending_pids if p not in final_pids]
+    # 신규상품 강제 노출 (명세 line 185): 등록 7일 이내 상품 1개를 슬롯으로 보장한다.
+    # 신규상품은 행동 이력이 없어 Two-Tower 후보에 거의 안 잡히므로,
+    # 후보 의존(기존 boost)이 아니라 강제 주입으로 노출 기회를 '보장' 한다.
+    new_slot = []
+    if new_pids and not cold_start:
+        exploit_cats = {prod_meta_dict.get(p, {}).get("category_L1") for p in diverse_pids[:top_n]}
+        new_cand = [p for p in new_pids if p not in diverse_pids]
+        relevant = [p for p in new_cand if prod_meta_dict.get(p, {}).get("category_L1") in exploit_cats]
+        pool = relevant if relevant else new_cand
+        if pool:
+            new_slot = [random.choice(pool)]
+
+    # 슬롯 예산: 신규상품(0~1) + MAB(1) 만큼 exploitation 에서 차감
+    reserve = len(new_slot) + 1
+    final_pids = diverse_pids[:max(top_n - reserve, 1)]
+
+    # MAB 탐색 슬롯 (Epsilon-Greedy)
+    used = set(final_pids) | set(new_slot)
+    explore_pool = [p for p in popular_pids + trending_pids if p not in used]
     random.shuffle(explore_pool)
-    explore_picks = explore_pool[:explore_count]
+    mab_count = max(1, top_n - len(final_pids) - len(new_slot))
+    explore_picks = explore_pool[:mab_count]
 
-    # 결과 조립
+    # 결과 조립: exploitation → 신규상품 슬롯 → MAB 슬롯
     final_recs = []
     for pid in final_pids:
-        reason = "personalized_deepfm"
-        if pid in set(new_pids):
-            reason = "new_product_boost"
+        if cold_start:
+            reason = "popular_fallback"
+        elif pid in new_pids_set:
+            reason = "new_product"
         elif session_interest and prod_meta_dict.get(pid, {}).get("category_L1") == session_interest:
             reason = "session_interest"
+        else:
+            reason = "personalized_deepfm"
         final_recs.append({
             "product_id": pid,
             "score": float(score_map.get(pid, 0.0)),
             "reason": reason,
+            "is_exploration": False,
+        })
+
+    for pid in new_slot:
+        final_recs.append({
+            "product_id": pid,
+            "score": 0.0,
+            "reason": "new_product",
             "is_exploration": False,
         })
 
@@ -563,7 +742,6 @@ async def recommend(
             "is_exploration": True,
         })
 
-    # 셔플하지 말고 다양성 정렬 한 번 더
     final_recs = final_recs[:top_n]
 
     reranking_ms = round((time.perf_counter() - t_s3) * 1000, 1)

@@ -1,21 +1,25 @@
 # ---------------------------------------------------------
-# 시뮬레이터 동작 설정 (H&M 데이터셋 카테고리 기준)
+# 시뮬레이터 + 데이터 생성 설정 v2
 # ---------------------------------------------------------
-#
 # 변경 요지:
-#   - target_category 를 H&M 의 실제 컬럼(category_L1 / L3) 기반으로 매칭
-#   - 상품명 부분문자열 매칭은 0건이 되는 키워드가 많아 폐기
-#   - 페르소나별 카테고리 선호가 데이터에 실제로 반영되도록 조정
+#   - 페르소나마다 narrow 한 cat_L3 + price_tier 조합 부여 → 페르소나 간 명확한 차별화
+#   - 새 필드: cat_L3_pool, price_tiers (prepare_hm_data.py 가 사용)
+#   - 구 필드(match_field, match_values, price_sensitivity)도 유지 → simulator.py 호환
 #
-# H&M data 의 실제 분포 (참고):
-#   category_L1: Ladieswear, Menswear, Baby/Children, Sport, Divided
-#   category_L3 (product_group_name): Garment Upper body, Trousers, Accessories,
-#                                     Shoes, Underwear, Socks & Tights, ...
+# H&M data 의 실제 cat_L3 분포:
+#   Garment Upper body 20506  (tier 균일 분포)
+#   Garment Lower body  9439  (high 47%)
+#   Garment Full body   6506  (high 56%)
+#   Accessories         4505  (low 73%)
+#   Underwear           3508  (low+med 90%)
+#   Swimwear            1958
+#   Shoes               1845  (high 58%)
+#   Socks & Tights       927  (low 95%)
+#   Nightwear            687
 
 api:
   log_endpoint: "http://api-server:8000/api/log"
 
-# 트래픽 분배 비율 (현실적인 고객 분포)
 persona_ratios:
   "트렌드세터": 0.15
   "실용주의자": 0.25
@@ -24,58 +28,69 @@ persona_ratios:
   "충동구매":   0.10
   "신중탐색":   0.10
 
-# 페르소나별 상세 설정
-#   match_field      : 매칭할 컬럼 (category_L1 | category_L3 | product_name | any)
-#   match_values     : 해당 컬럼에서 일치할 값 리스트 (대소문자 무시, 부분일치)
-#   view_to_cart     : view 이벤트가 cart 로 전환될 확률
-#   cart_to_purchase : cart 가 purchase 로 전환될 확률 → CVR ≈ 두 값의 곱
-#   search_prob      : 세션 시작 시 search 이벤트가 발생할 확률
-#   price_sensitivity: high → low tier 우선 / low → medium·high tier 우선 / medium → 필터 없음
 persona_configs:
   "트렌드세터":
+    cat_L3_pool: ["Garment Upper body"]
+    price_tiers: ["high"]
     match_field: "category_L3"
-    match_values: ["Trousers", "Garment Upper body"]   # 청바지/상의 트렌드
+    match_values: ["Garment Upper body"]
     view_to_cart: 0.15
-    cart_to_purchase: 0.40       # CVR ≈ 6%
+    cart_to_purchase: 0.40
     search_prob: 0.60
-    price_sensitivity: "medium"
+    price_sensitivity: "low"
+    p_core: 0.25  # 트렌드 탐색형 — core 비중 낮음
 
   "실용주의자":
+    cat_L3_pool: ["Underwear", "Socks & Tights"]
+    price_tiers: ["low", "medium"]
     match_field: "category_L3"
-    match_values: ["Garment Upper body", "Underwear", "Socks & Tights"]  # 베이직/실용
+    match_values: ["Underwear", "Socks & Tights"]
     view_to_cart: 0.08
-    cart_to_purchase: 0.50       # CVR ≈ 4%
+    cart_to_purchase: 0.50
     search_prob: 0.50
     price_sensitivity: "medium"
+    p_core: 0.55  # 양말/속옷 단골 — core 반복 (v8a 설정 유지)
 
   "가성비추구":
-    match_field: "any"           # 카테고리 무관, 가격대로만 필터
-    match_values: []
+    cat_L3_pool: ["Garment Upper body"]
+    price_tiers: ["low"]
+    match_field: "category_L3"
+    match_values: ["Garment Upper body"]
     view_to_cart: 0.10
-    cart_to_purchase: 0.50       # CVR ≈ 5%
+    cart_to_purchase: 0.50
     search_prob: 0.70
-    price_sensitivity: "high"    # low tier 우선
+    price_sensitivity: "high"
+    p_core: 0.40  # 검증된 가성비 아이템 재구매
 
   "브랜드충성":
-    match_field: "category_L1"
-    match_values: ["Ladieswear", "Menswear"]   # 메인 라인 위주
+    cat_L3_pool: ["Garment Full body", "Garment Lower body"]
+    price_tiers: ["high"]
+    match_field: "category_L3"
+    match_values: ["Garment Full body", "Garment Lower body"]
     view_to_cart: 0.12
-    cart_to_purchase: 0.45       # CVR ≈ 5.4%
+    cart_to_purchase: 0.45
     search_prob: 0.30
-    price_sensitivity: "low"     # medium/high tier 우선
+    price_sensitivity: "low"
+    p_core: 0.55  # 한 브랜드 안에서 반복 (v8a 설정 유지)
 
   "충동구매":
+    cat_L3_pool: ["Accessories", "Swimwear"]
+    price_tiers: ["low", "medium"]
     match_field: "category_L3"
-    match_values: ["Accessories", "Bags", "Shoes"]
+    match_values: ["Accessories", "Swimwear"]
     view_to_cart: 0.20
-    cart_to_purchase: 0.30       # CVR ≈ 6%
+    cart_to_purchase: 0.30
     search_prob: 0.20
-    price_sensitivity: "medium"
+    price_sensitivity: "high"
+    p_core: 0.25  # 충동적 — core 비중 낮음
 
   "신중탐색":
-    match_field: "any"           # 전체 탐색
-    match_values: []
+    cat_L3_pool: ["Shoes", "Nightwear"]
+    price_tiers: ["high", "medium"]
+    match_field: "category_L3"
+    match_values: ["Shoes", "Nightwear"]
     view_to_cart: 0.05
-    cart_to_purchase: 0.20       # CVR ≈ 1%
+    cart_to_purchase: 0.20
     search_prob: 0.80
-    price_sensitivity: "high"
+    price_sensitivity: "low"
+    p_core: 0.35  # 신중하지만 한번 결정 후 반복

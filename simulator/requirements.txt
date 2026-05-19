@@ -8,7 +8,6 @@ streamlit
 torch
 faiss-cpu
 transformers
-deep_translator
 redis
 scikit-learn
 plotly

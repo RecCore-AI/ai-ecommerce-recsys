@@ -1,0 +1,33 @@
+# ───────────── Python ─────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# ───────────── 백업 / 임시 파일 ─────────────
+*.bak
+*.ctbak
+*.tmp
+
+# ───────────── OS / IDE / 도구 ─────────────
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.claude/
+
+# ───────────── 로그 ─────────────
+logs/
+
+# ───────────── v1 시절 진단 문서 (현행과 무관 — 제출 제외) ─────────────
+context.md
+
+# ───────────── 데이터 · 모델 · 인덱스 ─────────────
+# 시뮬레이터 생성 데이터·학습 모델·FAISS 인덱스는 용량이 커서 레포에 포함하지 않는다.
+#   data/raw            : H&M 원본 데이터셋 (약 33GB, Kaggle 별도 다운로드)
+#   data/train_logs.csv : 약 359MB
+#   data/*.index        : FAISS 인덱스 각 약 111MB (GitHub 100MB 제한 초과)
+# README 의 재생성 파이프라인(섹션 5-2)으로 복원하거나 별도 공유 링크로 전달한다.
+# 단, 평가 지표 결과(metrics.json)는 평가자가 바로 확인하도록 추적한다.
+data/*
+!data/metrics.json

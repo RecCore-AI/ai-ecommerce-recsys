@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import datetime
 import shutil
@@ -10,7 +11,9 @@ import requests
 NEW_LOGS_PATH = "data/new_train_logs.csv"  # 실시간 시뮬레이터가 쏘는 로그
 ARCHIVE_DIR = "data/archive/"              # 재학습이 끝난 로그를 보관할 창고
 MODELS_DIR = "data/models/"                # 모델 가중치 폴더
+METRICS_PATH = "data/metrics.json"         # 오프라인 평가 지표 (성능 모니터링용)
 THRESHOLD = 10000                          # 재학습 트리거 임계값 (명세서 기준 1만건)
+PERF_THRESHOLDS = {"hitrate_50": 0.20, "auc": 0.70}  # 추천 성능 임계값 (명세 목표치)
 
 # 필요한 폴더가 없으면 자동 생성
 os.makedirs(ARCHIVE_DIR, exist_ok=True)
@@ -58,21 +61,54 @@ def trigger_retraining():
     print(f"🧹 처리된 로그 데이터는 안전하게 백업되었습니다. (파일명: {os.path.basename(archive_file)})\n")
     print(f"👁️ [CT Monitor] 다시 새로운 실시간 트래픽을 감시합니다...")
 
+def check_performance():
+    """metrics.json 의 추천 성능 지표를 점검하고, 임계값 이하로 떨어지면 알림을 출력한다.
+    (명세: 추천 성능 지표(HitRate/CTR) 모니터링 + 임계값 이하 시 성능 저하 알림)"""
+    if not os.path.exists(METRICS_PATH):
+        return
+    try:
+        with open(METRICS_PATH, 'r', encoding='utf-8') as f:
+            rec = json.load(f).get("recommend", {})
+    except Exception:
+        return
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    alerts = []
+    for metric, thr in PERF_THRESHOLDS.items():
+        val = rec.get(metric)
+        if val is not None and val < thr:
+            alerts.append(f"{metric} = {val:.4f}  (임계값 {thr} 이하)")
+
+    if alerts:
+        print(f"\n🔔 [CT Monitor] {now}")
+        for a in alerts:
+            print(f"   현재 {a}")
+        print("   ⚠️ 성능 저하 감지! 재학습을 권장합니다.\n")
+    else:
+        hr, auc = rec.get("hitrate_50"), rec.get("auc")
+        print(f"📈 [CT Monitor] {now}  추천 성능 정상 (HitRate@50={hr}, AUC={auc})")
+
+
 def run_monitor():
-    """무한 루프를 돌며 파일 크기를 감시하는 데몬 함수"""
+    """무한 루프를 돌며 ① 추천 성능 지표 ② 신규 로그 누적량을 감시하는 데몬 함수"""
     print("👁️ [CT Monitor] 실시간 데이터 모니터링 데몬 시작...")
-    
+
+    tick = 0
     while True:
+        # ① 성능 지표 모니터링 — 약 1분마다 (metrics.json 은 자주 바뀌지 않음)
+        if tick % 12 == 0:
+            check_performance()
+
+        # ② 신규 로그 누적량 — 1만 건을 넘기면 재학습 트리거
         log_count = count_new_logs()
-        
-        # 1만 건을 넘기면 재학습 트리거
         if log_count >= THRESHOLD:
             trigger_retraining()
         else:
             print(f"📊 [CT Monitor] 현재 신규 로그: {log_count}건 / 임계값: {THRESHOLD}건 (대기 중...)")
-            
-        # 서버 자원을 덜 쓰기 위해 5초마다 파일 상태 체크
-        time.sleep(5) 
+
+        tick += 1
+        # 서버 자원을 덜 쓰기 위해 5초마다 상태 체크
+        time.sleep(5)
 
 if __name__ == "__main__":
     run_monitor()
