@@ -133,7 +133,13 @@ def post_event(user_id: str, product_id: str, event_type: str, timestamp: int) -
     except requests.exceptions.RequestException:
         pass
 
+    # CT 가 LOG_FILE 을 archive 로 옮긴 직후엔 파일이 없으므로,
+    # append 전에 매번 파일 존재 여부를 확인해서 없으면 헤더부터 쓴다.
+    # (이 검사를 빼면 헤더 없는 새 파일이 만들어져 dashboard 가 KeyError 로 죽음)
+    need_header = not os.path.exists(LOG_FILE)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
+        if need_header:
+            f.write("user_id,product_id,event_type,timestamp\n")
         f.write(f"{user_id},{product_id},{event_type},{timestamp}\n")
 
 

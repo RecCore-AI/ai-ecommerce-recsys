@@ -32,6 +32,8 @@ import pandas as pd
 import redis
 from datetime import datetime, timedelta
 from fastapi import FastAPI, UploadFile, File, Form, Query
+from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Literal
 from transformers import CLIPProcessor, CLIPModel
@@ -55,9 +57,23 @@ NEW_PRODUCT_DAYS = 7        # 신규 상품 정의: 7일 이내
 NEW_USER_HISTORY_THRESHOLD = 5  # 신규 유저 정의: 행동 5개 미만
 EPSILON         = 0.1       # MAB exploration ratio
 MAX_SAME_CATEGORY_RUN = 2   # 연속 3개 금지 → 같은 카테고리 연속 2개까지 허용
+# 하이브리드(텍스트+이미지) 검색 late-fusion 가중치 (텍스트 : 이미지)
+HYBRID_W_TEXT  = 0.5
+HYBRID_W_IMAGE = 0.5
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 app = FastAPI(title="Multi-Stage Recommender API")
+
+# 데모 페이지가 (필요 시) 다른 출처에서 호출돼도 동작하도록 CORS 허용.
+# 같은 출처(서버가 직접 서빙)로 쓰면 사실상 영향 없음 — 발표 시 호스팅 유연성 확보용.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+)
+
+# 상품 이미지 원본 경로 (P0108775015 → 010/0108775015.jpg)
+IMAGES_DIR = f"{DATA_DIR}/raw/images"
+DEMO_HTML  = "demo.html"
 
 
 # ──────────────────────────────────────────────
@@ -503,40 +519,59 @@ async def personalized_search(
                 img_f = pooler if pooler is not None else embeds
             image_emb = img_f / img_f.norm(dim=-1, keepdim=True)
 
-    # 검색 타입 결정
-    if query and file:
-        search_type = "hybrid"
-        final_emb = (text_emb + image_emb) / 2.0
-        final_emb = final_emb / final_emb.norm(dim=-1, keepdim=True)
-    elif query:
-        search_type = "text"
-        final_emb = text_emb
-    else:
-        search_type = "image"
-        final_emb = image_emb
-
-    # FAISS 유사도 검색 — 검색은 "유사 상품 찾기" 이므로 유사도 순으로 정렬한다.
-    # image 전용 검색은 상품 이미지 임베딩(image.index), text/hybrid 는 text.index 사용.
-    # (개인화 재정렬은 추천 API 의 역할 — 검색에 적용하면 retrieve 정확도가 훼손됨)
-    search_index = image_faiss if search_type == "image" else text_faiss
-    final_np = final_emb.cpu().numpy().astype("float32")
-    distances, indices = search_index.search(final_np, top_k)
-
     user_info = df_users[df_users["user_id"] == user_id]
     persona = user_info["persona"].values[0] if not user_info.empty else "신규가입자"
 
     # 정규화 임베딩 → squared L2 거리를 코사인 유사도로 변환 (cos = 1 - d/2)
-    results = []
-    for dist, idx in zip(distances[0], indices[0]):
-        if idx < 0:
-            continue
-        prod = df_prods.iloc[int(idx)]
-        results.append({
-            "product_id": prod["product_id"],
-            "name":       prod["product_name"],
-            "score":      round(float(max(0.0, 1.0 - dist / 2.0)), 4),
-            "price":      int(prod["price"]),
-        })
+    def _cos(d):
+        return max(0.0, 1.0 - float(d) / 2.0)
+
+    def _to_results(idx_list, score_list):
+        out = []
+        for idx, sc in zip(idx_list, score_list):
+            if int(idx) < 0:
+                continue
+            prod = df_prods.iloc[int(idx)]
+            out.append({
+                "product_id": prod["product_id"],
+                "name":       prod["product_name"],
+                "score":      round(float(sc), 4),
+                "price":      int(prod["price"]),
+            })
+        return out
+
+    # FAISS 유사도 검색 — 검색은 "유사 상품 찾기" 이므로 유사도 순으로 정렬한다.
+    if query and file:
+        # 하이브리드: 텍스트는 text.index, 이미지는 image.index 에서 각각 검색한 뒤
+        # 코사인 유사도를 가중 합산(late fusion)해 재정렬 → 텍스트·이미지가 함께 결과를 결정.
+        search_type = "hybrid"
+        K = max(top_k * 20, 200)  # 두 인덱스 후보를 넉넉히 받아 합산
+        t_np = text_emb.cpu().numpy().astype("float32")
+        i_np = image_emb.cpu().numpy().astype("float32")
+        _, idx_t = text_faiss.search(t_np, K)
+        _, idx_i = image_faiss.search(i_np, K)
+        # 텍스트·이미지 코사인 유사도는 스케일이 달라(이미지가 보통 더 큼) 그대로 합치면
+        # 이미지가 항상 이긴다. 각 모달 결과의 '순위'를 0~1 로 정규화해 합산 → 진짜 균형.
+        combined = {}
+        for rank, idx in enumerate(idx_t[0]):
+            if int(idx) < 0:
+                continue
+            combined[int(idx)] = combined.get(int(idx), 0.0) + HYBRID_W_TEXT * (K - rank) / K
+        for rank, idx in enumerate(idx_i[0]):
+            if int(idx) < 0:
+                continue
+            combined[int(idx)] = combined.get(int(idx), 0.0) + HYBRID_W_IMAGE * (K - rank) / K
+        ranked = sorted(combined.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+        results = _to_results([i for i, _ in ranked], [s for _, s in ranked])
+    else:
+        # 단일 모달: 텍스트 전용은 text.index, 이미지 전용은 image.index 사용.
+        if query:
+            search_type = "text";  final_emb = text_emb;  search_index = text_faiss
+        else:
+            search_type = "image"; final_emb = image_emb; search_index = image_faiss
+        final_np = final_emb.cpu().numpy().astype("float32")
+        distances, indices = search_index.search(final_np, top_k)
+        results = _to_results(indices[0], [_cos(d) for d in distances[0]])
 
     latency = round((time.perf_counter() - t0) * 1000, 1)
 
@@ -793,3 +828,129 @@ async def health():
         "n_products": len(df_prods),
         "n_users": len(df_users),
     }
+
+
+# ══════════════════════════════════════════════
+# 데모 지원: 상품 이미지 서빙 + 비교 데모 페이지
+# ══════════════════════════════════════════════
+_TRANSPARENT_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+    "890000000a49444154789c6360000002000154a24f1f0000000049454e44ae426082"
+)
+
+
+@app.get("/images/{product_id}")
+async def product_image(product_id: str):
+    """상품 이미지 원본을 서빙한다. P0108775015 → data/raw/images/010/0108775015.jpg.
+    파일이 없으면 1x1 투명 PNG 를 반환해 데모 그리드가 깨지지 않게 한다."""
+    digits = product_id[1:] if product_id.startswith("P") else product_id
+    folder = digits[:3]
+    path = os.path.join(IMAGES_DIR, folder, f"{digits}.jpg")
+    if os.path.exists(path):
+        return FileResponse(path, media_type="image/jpeg")
+    return Response(content=_TRANSPARENT_PNG, media_type="image/png")
+
+
+@app.get("/api/products")
+async def products(ids: str = Query("")):
+    """데모 지원용 — product_id 목록을 받아 이름/가격/카테고리를 돌려준다.
+    (스펙 평가 대상인 /api/recommend 응답 스키마를 건드리지 않기 위한 보조 엔드포인트)"""
+    out = []
+    for pid in [x for x in ids.split(",") if x]:
+        m = prod_meta_dict.get(pid)
+        if m:
+            out.append({
+                "product_id":  pid,
+                "name":        m.get("product_name"),
+                "price":       int(m.get("price", 0)),
+                "category_L1": m.get("category_L1"),
+                "category_L3": m.get("category_L3"),
+            })
+    return {"products": out}
+
+
+@app.get("/api/categories")
+async def categories():
+    """데모 지원용 — category_L1 목록과 상품 수를 돌려준다. (랜딩 페이지 카탈로그 탭용)"""
+    vc = df_prods["category_L1"].value_counts()
+    return {"categories": [{"name": str(k), "count": int(v)} for k, v in vc.items()]}
+
+
+@app.get("/api/catalog")
+async def catalog(
+    category: str = Query(""),
+    page: int = Query(1),
+    page_size: int = Query(24),
+    sort: Literal["popular", "price_asc", "price_desc", "random"] = Query("popular"),
+):
+    """데모 지원용 — 카테고리별 상품 목록(페이지네이션)을 돌려준다.
+    추천/검색이 아닌 '카탈로그 브라우징' 용도. 평가 대상 스키마(/api/recommend)는 건드리지 않는다."""
+    df = df_prods
+    if category:
+        df = df[df["category_L1"].astype(str) == category]
+
+    if sort == "popular":
+        order = df["product_id"].map(pid_global_count).fillna(0)
+        df = df.assign(_pop=order).sort_values("_pop", ascending=False)
+    elif sort == "price_asc":
+        df = df.sort_values("price", ascending=True)
+    elif sort == "price_desc":
+        df = df.sort_values("price", ascending=False)
+    elif sort == "random":
+        df = df.sample(frac=1.0, random_state=random.randint(0, 1_000_000))
+
+    total = len(df)
+    start = max(page - 1, 0) * page_size
+    page_df = df.iloc[start:start + page_size]
+
+    out = []
+    for _, prod in page_df.iterrows():
+        out.append({
+            "product_id":  prod["product_id"],
+            "name":        prod["product_name"],
+            "price":       int(prod["price"]),
+            "price_tier":  prod["price_tier"],
+            "category_L1": prod["category_L1"],
+            "category_L3": prod["category_L3"],
+        })
+    return {
+        "category": category or "all",
+        "sort": sort,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "has_more": start + page_size < total,
+        "products": out,
+    }
+
+
+@app.get("/api/user-history")
+async def user_history(user_id: str = Query("U000058a12d"), n: int = Query(8)):
+    """데모 지원용 — 해당 사용자가 과거에 담거나 구매한 상품(최근 n개)을 돌려준다.
+    '같은 페르소나라도 개인 이력에 따라 추천이 달라진다'를 보여주기 위한 근거 표시용."""
+    df = df_logs[(df_logs["user_id"] == user_id) &
+                 (df_logs["event_type"].isin(["cart", "purchase"]))]
+    pids = df.sort_values("timestamp")["product_id"].tolist() if "timestamp" in df.columns \
+        else df["product_id"].tolist()
+    seen, uniq = set(), []
+    for p in reversed(pids):  # 최근 것부터, 중복 제거
+        if p not in seen:
+            seen.add(p); uniq.append(p)
+        if len(uniq) >= n:
+            break
+    out = []
+    for pid in uniq:
+        m = prod_meta_dict.get(pid)
+        if m:
+            out.append({"product_id": pid, "name": m.get("product_name"),
+                        "price": int(m.get("price", 0)), "category_L3": m.get("category_L3")})
+    return {"user_id": user_id, "purchase_count": int(len(df)), "history": out}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def demo_page():
+    """발표용 라이브 비교 데모 페이지. 같은 출처에서 /api/* 를 호출한다."""
+    if os.path.exists(DEMO_HTML):
+        with open(DEMO_HTML, "r", encoding="utf-8") as f:
+            return HTMLResponse(f.read())
+    return HTMLResponse("<h1>demo.html 이 없습니다.</h1>", status_code=404)

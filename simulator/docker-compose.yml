@@ -26,7 +26,7 @@ services:
     build: .
     container_name: dashboard
     # streamlit으로 대시보드 실행
-    command: streamlit run phase4_dashboard.py --server.port 8501 --server.address 0.0.0.0
+    command: streamlit run phase4_dashboard.py --server.port 8501 --server.address 0.0.0.0 --server.enableCORS=false --server.enableXsrfProtection=false
     ports:
       - "8501:8501"
     depends_on:
