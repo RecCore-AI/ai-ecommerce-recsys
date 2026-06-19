@@ -40,6 +40,8 @@ from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
 from sklearn.preprocessing import LabelEncoder
 
+import ko_fashion   # Query Understanding(보너스#1): 자연어 쿼리 → 가격/색상/카테고리 필터
+
 # ──────────────────────────────────────────────
 # 설정
 # ──────────────────────────────────────────────
@@ -198,6 +200,17 @@ clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 clip_model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device).eval()
 text_faiss     = faiss.read_index(TEXT_INDEX_PATH)
 image_faiss    = faiss.read_index(IMAGE_INDEX_PATH) if os.path.exists(IMAGE_INDEX_PATH) else text_faiss
+
+# M-CLIP 텍스트→이미지 인코더 (한/영 의미검색). CLIP text.index 의 text↔text 정확매칭 한계를
+# 보완: 다국어 텍스트를 CLIP 이미지공간에 정렬한 인코더로 image.index 를 검색해 '의미적으로
+# 닮은' 상품을 회수, CLIP text.index 순위와 RRF 융합. 미설치/실패 시 CLIP 단독으로 graceful fallback.
+try:
+    import mclip_search as _mc
+    mclip_enc = _mc.get_encoder()
+    print("🚀 [1/5] M-CLIP 텍스트→이미지 인코더 로드 완료 (한/영 의미검색)")
+except Exception as e:
+    print(f"⚠️  M-CLIP 인코더 로드 실패({e}) — CLIP 단독 텍스트검색으로 동작.")
+    mclip_enc = None
 
 print("🚀 [2/5] 메타데이터 로드...")
 df_prods = pd.read_csv(f"{DATA_DIR}/products.csv")
@@ -492,13 +505,18 @@ async def personalized_search(
     if not query and not file:
         return {"error": "query 또는 file 중 하나는 필수입니다."}
 
+    # Query Understanding(보너스#1): 가격/색상/카테고리 필터 추출. 가격 문구는 검색어에서 제거
+    # ('5만원'의 '5'가 임베딩/매칭을 오염시키는 것 방지). 가격·색상은 결과 하드필터로 적용.
+    qu_filters   = ko_fashion.extract_filters(query) if query else {}
+    search_query = ko_fashion.strip_price(query) if query else query
+
     # 임베딩 생성
     text_emb, image_emb = None, None
 
     if query:
-        # text.index 는 영문 product_name 으로 구축됨(phase1) — 평가(phase4)도 영문 쿼리로 측정.
-        # project.md line 403(외부 클라우드 API 금지) 준수 위해 외부 번역기 제거, 쿼리를 그대로 인코딩.
-        tok = clip_processor.tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=77).to(device)
+        # CLIP Text Encoder 로 쿼리 임베딩(명세 line 134). text.index 는 영문 product_name 기반.
+        # project.md line 403(외부 클라우드 API 금지) 준수 — 외부 번역기 없이 로컬 인코딩만.
+        tok = clip_processor.tokenizer(search_query, return_tensors="pt", padding=True, truncation=True, max_length=77).to(device)
         with torch.no_grad():
             tf = clip_model.get_text_features(input_ids=tok["input_ids"], attention_mask=tok["attention_mask"])
             if not isinstance(tf, torch.Tensor):
@@ -540,37 +558,77 @@ async def personalized_search(
             })
         return out
 
+    # Query Understanding 하드필터: 가격(price 컬럼)·색상(상품명 명시)로 결과를 거른다.
+    # 카테고리는 retrieval 이 처리하므로 표시만(부분일치 하드필터는 취약). 전부 걸러지면 원본 폴백.
+    def _passes(idx) -> bool:
+        prod = df_prods.iloc[int(idx)]
+        price = int(prod["price"])
+        if "price_max" in qu_filters and price > qu_filters["price_max"]:
+            return False
+        if "price_min" in qu_filters and price < qu_filters["price_min"]:
+            return False
+        color = qu_filters.get("color")
+        if color and color not in str(prod["product_name"]).lower():
+            return False
+        return True
+
+    def _apply_filters(ranked_full):
+        if not qu_filters:
+            return ranked_full
+        kept = [(i, s) for i, s in ranked_full if _passes(i)]
+        return kept if kept else ranked_full
+
+    # M-CLIP 텍스트→이미지 회수(한/영 의미): search_query 를 image.index 에서 검색해 idx 순위 반환.
+    def _mclip_rank(pool):
+        if mclip_enc is None or not query:
+            return []
+        _, mi = image_faiss.search(mclip_enc.encode_query(search_query), pool)
+        return [int(i) for i in mi[0] if int(i) >= 0]
+
+    RRF_K, SCORE_SCALE = 60, 30   # RRF 융합 상수 / 표시용 0~1 환산
+
     # FAISS 유사도 검색 — 검색은 "유사 상품 찾기" 이므로 유사도 순으로 정렬한다.
     if query and file:
-        # 하이브리드: 텍스트는 text.index, 이미지는 image.index 에서 각각 검색한 뒤
-        # 코사인 유사도를 가중 합산(late fusion)해 재정렬 → 텍스트·이미지가 함께 결과를 결정.
+        # 하이브리드: CLIP text.index + CLIP image.index + M-CLIP(한/영 의미)를 RRF 융합.
+        # 순위 기반 RRF 라 모달 간 스케일 차이에 무관하게 균형 결합된다.
         search_type = "hybrid"
-        K = max(top_k * 20, 200)  # 두 인덱스 후보를 넉넉히 받아 합산
-        t_np = text_emb.cpu().numpy().astype("float32")
-        i_np = image_emb.cpu().numpy().astype("float32")
-        _, idx_t = text_faiss.search(t_np, K)
-        _, idx_i = image_faiss.search(i_np, K)
-        # 텍스트·이미지 코사인 유사도는 스케일이 달라(이미지가 보통 더 큼) 그대로 합치면
-        # 이미지가 항상 이긴다. 각 모달 결과의 '순위'를 0~1 로 정규화해 합산 → 진짜 균형.
-        combined = {}
-        for rank, idx in enumerate(idx_t[0]):
-            if int(idx) < 0:
-                continue
-            combined[int(idx)] = combined.get(int(idx), 0.0) + HYBRID_W_TEXT * (K - rank) / K
+        K = max(top_k * 20, 200)
+        _, idx_i = image_faiss.search(image_emb.cpu().numpy().astype("float32"), K)
+        fused = {}
+        if not ko_fashion.has_korean(query or ""):   # 한글은 CLIP text↔text 노이즈 → 제외
+            _, idx_t = text_faiss.search(text_emb.cpu().numpy().astype("float32"), K)
+            for rank, idx in enumerate(idx_t[0]):
+                if int(idx) < 0:
+                    continue
+                fused[int(idx)] = fused.get(int(idx), 0.0) + HYBRID_W_TEXT / (RRF_K + rank)
         for rank, idx in enumerate(idx_i[0]):
             if int(idx) < 0:
                 continue
-            combined[int(idx)] = combined.get(int(idx), 0.0) + HYBRID_W_IMAGE * (K - rank) / K
-        ranked = sorted(combined.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
-        results = _to_results([i for i, _ in ranked], [s for _, s in ranked])
+            fused[int(idx)] = fused.get(int(idx), 0.0) + HYBRID_W_IMAGE / (RRF_K + rank)
+        for rank, idx in enumerate(_mclip_rank(K)):
+            fused[idx] = fused.get(idx, 0.0) + HYBRID_W_TEXT / (RRF_K + rank)
+        ranked = _apply_filters(sorted(fused.items(), key=lambda kv: kv[1], reverse=True))[:top_k]
+        results = _to_results([i for i, _ in ranked], [min(1.0, s * SCORE_SCALE) for _, s in ranked])
+    elif query:
+        # 텍스트 전용: CLIP text.index(어휘/정확매칭) + M-CLIP text→image(한/영 의미) RRF 융합.
+        # 한글 쿼리는 CLIP text↔text 가 약하므로 M-CLIP 이 전담, 영어는 두 신호가 보강된다.
+        search_type = "text"
+        K = max(top_k * 20, 200)
+        fused = {}
+        if not ko_fashion.has_korean(query or ""):   # 한글은 CLIP text↔text 노이즈 → M-CLIP 전담
+            _, idx_t = text_faiss.search(text_emb.cpu().numpy().astype("float32"), K)
+            for rank, idx in enumerate(idx_t[0]):
+                if int(idx) < 0:
+                    continue
+                fused[int(idx)] = fused.get(int(idx), 0.0) + 1.0 / (RRF_K + rank)
+        for rank, idx in enumerate(_mclip_rank(K)):
+            fused[idx] = fused.get(idx, 0.0) + 1.0 / (RRF_K + rank)
+        ranked = _apply_filters(sorted(fused.items(), key=lambda kv: kv[1], reverse=True))[:top_k]
+        results = _to_results([i for i, _ in ranked], [min(1.0, s * SCORE_SCALE) for _, s in ranked])
     else:
-        # 단일 모달: 텍스트 전용은 text.index, 이미지 전용은 image.index 사용.
-        if query:
-            search_type = "text";  final_emb = text_emb;  search_index = text_faiss
-        else:
-            search_type = "image"; final_emb = image_emb; search_index = image_faiss
-        final_np = final_emb.cpu().numpy().astype("float32")
-        distances, indices = search_index.search(final_np, top_k)
+        # 이미지 전용: CLIP image.index
+        search_type = "image"
+        distances, indices = image_faiss.search(image_emb.cpu().numpy().astype("float32"), top_k)
         results = _to_results(indices[0], [_cos(d) for d in distances[0]])
 
     latency = round((time.perf_counter() - t0) * 1000, 1)
@@ -583,6 +641,7 @@ async def personalized_search(
         "user_id": user_id,
         "persona": persona,
         "original_query": query,
+        "parsed_filters": qu_filters,   # Query Understanding(보너스#1): 추출된 가격/색상/카테고리
     }
 
 

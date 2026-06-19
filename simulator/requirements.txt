@@ -8,6 +8,7 @@ streamlit
 torch
 faiss-cpu
 transformers
+sentence-transformers
 redis
 scikit-learn
 plotly
